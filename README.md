@@ -11,6 +11,9 @@
 
 ---
 
+<img width="1479" height="715" alt="Captura de pantalla 2026-02-20 150635" src="https://github.com/user-attachments/assets/88e6981f-7601-40a5-a8af-5c2ddf6e2b17" />
+
+
 ## What is this?
 
 MinMax TUI is a fully interactive AI chat interface that runs in your terminal. It connects to MiniMax's reasoning models and gives the AI direct access to your filesystem — reading, writing, editing files, running commands, and more — all through a clean, themed terminal UI.
