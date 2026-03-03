@@ -53,14 +53,23 @@ pub async fn execute(args: Value) -> ToolExecutionResult {
     }
 
     match fs::write(path, content).await {
-        Ok(_) => ToolExecutionResult::with_meta(
-            format!("File written successfully: {}", path),
-            ToolResultMeta::WriteFile {
-                path: path.to_string(),
-                content: content.to_string(),
-                is_new,
-            },
-        ),
+        Ok(_) => {
+            let mut msg = format!("File written successfully: {}", path);
+
+            // Run syntax check on the written file
+            if let Some(diag) = super::lint::check_syntax(path).await {
+                msg.push_str(&diag);
+            }
+
+            ToolExecutionResult::with_meta(
+                msg,
+                ToolResultMeta::WriteFile {
+                    path: path.to_string(),
+                    content: content.to_string(),
+                    is_new,
+                },
+            )
+        }
         Err(e) => ToolExecutionResult::text(format!("Error writing file: {}", e)),
     }
 }

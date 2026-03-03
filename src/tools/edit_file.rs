@@ -62,14 +62,23 @@ pub async fn execute(args: Value) -> ToolExecutionResult {
 
     let new_content = content.replacen(old_str, new_str, 1);
     match fs::write(path, &new_content).await {
-        Ok(_) => ToolExecutionResult::with_meta(
-            format!("File edited successfully: {}", path),
-            ToolResultMeta::EditFile {
-                path: path.to_string(),
-                old_str: old_str.to_string(),
-                new_str: new_str.to_string(),
-            },
-        ),
+        Ok(_) => {
+            let mut msg = format!("File edited successfully: {}", path);
+
+            // Run syntax check on the edited file
+            if let Some(diag) = super::lint::check_syntax(path).await {
+                msg.push_str(&diag);
+            }
+
+            ToolExecutionResult::with_meta(
+                msg,
+                ToolResultMeta::EditFile {
+                    path: path.to_string(),
+                    old_str: old_str.to_string(),
+                    new_str: new_str.to_string(),
+                },
+            )
+        }
         Err(e) => ToolExecutionResult::text(format!("Error writing file: {}", e)),
     }
 }

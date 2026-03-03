@@ -187,7 +187,7 @@ impl MiniMaxClient {
             "messages": messages,
             "stream": true,
             "stream_options": { "include_usage": true },
-            "temperature": 1.0,
+            "temperature": 0.3,
         });
 
         if let Some(tools) = tools {

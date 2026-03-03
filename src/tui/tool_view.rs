@@ -53,6 +53,21 @@ pub fn render_tool_result_lines<'a>(msg: &DisplayMessage, theme: &Theme, width: 
         Span::styled(status_icon.to_string(), Style::default().fg(status_color)),
     ]));
 
+    // Sub-agent tool progress (compact inline display)
+    if tool_name == "sub_agent" && !msg.sub_tools.is_empty() {
+        let mut spans = vec![Span::raw("    ")];
+        for (name, status) in &msg.sub_tools {
+            let (icon, color) = match status {
+                ToolStatus::Running => ("…", warning),
+                ToolStatus::Done => ("✓", success),
+                ToolStatus::Error => ("✗", error),
+            };
+            spans.push(Span::styled(format!("{} ", name), Style::default().fg(dim)));
+            spans.push(Span::styled(format!("{}  ", icon), Style::default().fg(color)));
+        }
+        lines.push(TuiLine::from(spans));
+    }
+
     // Content preview (truncated)
     if !msg.content.is_empty() {
         let max_preview_lines = 8;
