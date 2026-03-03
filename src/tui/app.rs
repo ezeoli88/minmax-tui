@@ -45,6 +45,8 @@ pub struct DisplayMessage {
     pub is_streaming: bool,
     pub tool_status: Option<ToolStatus>,
     pub tool_name: Option<String>,
+    /// Progress of tools used inside a sub_agent call.
+    pub sub_tools: Vec<(String, ToolStatus)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -624,6 +626,7 @@ impl App {
             is_streaming: false,
             tool_status: None,
             tool_name: None,
+            sub_tools: Vec::new(),
         });
 
         // Reset scroll to bottom
@@ -657,6 +660,7 @@ impl App {
             is_streaming: true,
             tool_status: None,
             tool_name: None,
+            sub_tools: Vec::new(),
         });
 
         // Spawn the streaming task and return the engine via oneshot
@@ -861,6 +865,7 @@ impl App {
                         is_streaming: true,
                         tool_status: None,
                         tool_name: None,
+                        sub_tools: Vec::new(),
                     });
                 }
             }
@@ -923,6 +928,7 @@ impl App {
                     is_streaming: false,
                     tool_status: Some(ToolStatus::Running),
                     tool_name: Some(name),
+                    sub_tools: Vec::new(),
                 });
             }
             ChatEvent::ToolExecutionDone {
@@ -988,6 +994,37 @@ impl App {
                     compressed_tokens / 1000
                 ));
             }
+            ChatEvent::SubAgentProgress {
+                id: _,
+                tool_name,
+                done,
+                error,
+            } => {
+                // Find the running sub_agent tool message and update its sub_tools
+                if let Some(msg) = self.messages.iter_mut().rev().find(|m| {
+                    m.role == MessageRole::Tool
+                        && m.tool_name.as_deref() == Some("sub_agent")
+                        && m.tool_status == Some(ToolStatus::Running)
+                }) {
+                    if done {
+                        // Update the last Running entry for this tool_name to Done/Error
+                        if let Some(entry) = msg
+                            .sub_tools
+                            .iter_mut()
+                            .rev()
+                            .find(|e| e.0 == tool_name && e.1 == ToolStatus::Running)
+                        {
+                            entry.1 = if error {
+                                ToolStatus::Error
+                            } else {
+                                ToolStatus::Done
+                            };
+                        }
+                    } else {
+                        msg.sub_tools.push((tool_name, ToolStatus::Running));
+                    }
+                }
+            }
         }
     }
 
@@ -1014,6 +1051,7 @@ impl App {
                     is_streaming: false,
                     tool_status: None,
                     tool_name: None,
+                    sub_tools: Vec::new(),
                 });
             }
             CommandResult::NewSession => {
@@ -1116,6 +1154,7 @@ impl App {
                     None
                 },
                 tool_name: msg.name.clone(),
+                sub_tools: Vec::new(),
             });
         }
 

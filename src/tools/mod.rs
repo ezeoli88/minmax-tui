@@ -6,6 +6,7 @@ pub mod grep;
 pub mod lint;
 pub mod list_dir;
 pub mod read_file;
+pub mod sub_agent;
 pub mod todo_write;
 pub mod web_fetch;
 pub mod web_search;
@@ -31,6 +32,7 @@ pub fn system_reminder(mode: Mode, tool_name: &str) -> String {
         "read_file" => "",
         "glob" | "grep" => " Use read_file to examine matches before editing.",
         "web_search" | "web_fetch" => "",
+        "sub_agent" => " Review sub-agent findings carefully.",
         _ => "",
     };
 
@@ -106,18 +108,35 @@ pub fn get_tool_definitions(mode: Mode) -> Vec<Value> {
 
     match mode {
         Mode::Builder => all,
-        Mode::Plan => all
-            .into_iter()
-            .filter(|d| {
-                let name = d
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("");
-                READ_ONLY_TOOLS.contains(name)
-            })
-            .collect(),
+        Mode::Plan => {
+            let mut plan_tools: Vec<Value> = all
+                .into_iter()
+                .filter(|d| {
+                    let name = d
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("");
+                    READ_ONLY_TOOLS.contains(name)
+                })
+                .collect();
+            // sub_agent is only available in PLAN mode
+            plan_tools.push(sub_agent::definition());
+            plan_tools
+        }
     }
+}
+
+/// Returns tool definitions for sub-agents (read-only, no interactive or recursive tools).
+pub fn get_sub_agent_tool_definitions() -> Vec<Value> {
+    vec![
+        read_file::definition(),
+        glob::definition(),
+        grep::definition(),
+        list_dir::definition(),
+        web_search::definition(),
+        web_fetch::definition(),
+    ]
 }
 
 /// Execute a tool by name with the given arguments.
@@ -126,8 +145,8 @@ pub async fn execute_tool(
     args: Value,
     mode: Mode,
 ) -> ToolExecutionResult {
-    // PLAN mode enforcement
-    if mode == Mode::Plan && !READ_ONLY_TOOLS.contains(name) && !name.starts_with("mcp__") {
+    // PLAN mode enforcement (sub_agent is intercepted in chat.rs, not executed here)
+    if mode == Mode::Plan && !READ_ONLY_TOOLS.contains(name) && name != "sub_agent" && !name.starts_with("mcp__") {
         return ToolExecutionResult::text(format!(
             "Error: Tool \"{}\" is not available in PLAN mode. Switch to BUILDER mode (Tab) to use it.",
             name

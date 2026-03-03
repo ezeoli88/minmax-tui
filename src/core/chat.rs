@@ -98,6 +98,13 @@ pub enum ChatEvent {
         original_tokens: usize,
         compressed_tokens: usize,
     },
+    /// Progress from a running sub-agent (tool start/done events forwarded).
+    SubAgentProgress {
+        id: String,
+        tool_name: String,
+        done: bool,
+        error: bool,
+    },
 }
 
 /// The final assistant message after streaming completes.
@@ -130,9 +137,11 @@ pub struct ChatEngine {
     session_id: Option<String>,
     session_store: Option<Arc<SessionStore>>,
     total_tokens: u64,
-    accumulated_completion_tokens: u64,
+    pub accumulated_completion_tokens: u64,
     cancel_token: CancellationToken,
     mcp_manager: Option<Arc<tokio::sync::Mutex<McpManager>>>,
+    max_turns: Option<usize>,
+    is_sub_agent: bool,
 }
 
 impl ChatEngine {
@@ -148,6 +157,8 @@ impl ChatEngine {
             accumulated_completion_tokens: 0,
             cancel_token: CancellationToken::new(),
             mcp_manager: None,
+            max_turns: None,
+            is_sub_agent: false,
         }
     }
 
@@ -166,6 +177,24 @@ impl ChatEngine {
 
     pub fn set_model(&mut self, model: &str) {
         self.model = model.to_string();
+    }
+
+    pub fn set_max_turns(&mut self, limit: usize) {
+        self.max_turns = Some(limit);
+    }
+
+    pub fn set_sub_agent(&mut self, val: bool) {
+        self.is_sub_agent = val;
+    }
+
+    /// Extract the last assistant message content from history.
+    pub fn last_assistant_content(&self) -> Option<String> {
+        self.history
+            .iter()
+            .rev()
+            .find(|msg| msg.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .and_then(|msg| msg.get("content").and_then(|c| c.as_str()))
+            .map(|s| s.to_string())
     }
 
     pub fn total_tokens(&self) -> u64 {
@@ -193,6 +222,19 @@ impl ChatEngine {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
+
+        // Sub-agents get a focused, minimal system prompt
+        if self.is_sub_agent {
+            return format!(
+                "You are a research sub-agent with read-only codebase access.\n\
+                Working directory: {}\n\n\
+                Available tools: read_file, glob, grep, list_directory, web_search, web_fetch.\n\
+                You CANNOT write, edit, run commands, ask questions, or spawn sub-agents.\n\n\
+                Investigate thoroughly, then provide a complete, structured answer.\n\
+                Your final message must contain the full answer — it will be returned to the parent agent.",
+                cwd
+            );
+        }
 
         let base = match self.mode {
             Mode::Plan => format!(
@@ -457,7 +499,16 @@ impl ChatEngine {
         self.cancel_token = token;
     }
 
-    pub async fn send_message(
+    pub fn send_message<'a>(
+        &'a mut self,
+        user_input: &'a str,
+        file_context: Option<&'a str>,
+        event_tx: mpsc::UnboundedSender<ChatEvent>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.send_message_inner(user_input, file_context, event_tx))
+    }
+
+    async fn send_message_inner(
         &mut self,
         user_input: &str,
         file_context: Option<&str>,
@@ -480,10 +531,17 @@ impl ChatEngine {
         self.persist_message("user", user_input, None, None, None);
 
         // Agentic loop
+        let mut turn_count: usize = 0;
         loop {
             if self.cancel_token.is_cancelled() {
                 break;
             }
+            if let Some(max) = self.max_turns {
+                if turn_count >= max {
+                    break;
+                }
+            }
+            turn_count += 1;
 
             let _ = event_tx.send(ChatEvent::StreamStart);
 
@@ -495,11 +553,17 @@ impl ChatEngine {
                 )));
             }
 
-            let mut tool_defs = tools::get_tool_definitions(self.mode);
-            // Append MCP tool definitions if available
-            if let Some(mcp) = &self.mcp_manager {
-                if let Ok(manager) = mcp.try_lock() {
-                    tool_defs.extend(manager.get_tool_definitions());
+            let mut tool_defs = if self.is_sub_agent {
+                tools::get_sub_agent_tool_definitions()
+            } else {
+                tools::get_tool_definitions(self.mode)
+            };
+            // Append MCP tool definitions if available (not for sub-agents)
+            if !self.is_sub_agent {
+                if let Some(mcp) = &self.mcp_manager {
+                    if let Ok(manager) = mcp.try_lock() {
+                        tool_defs.extend(manager.get_tool_definitions());
+                    }
                 }
             }
             let full_history = self.build_full_history();
@@ -840,6 +904,118 @@ impl ChatEngine {
                             tc.function.name.clone(),
                             tools::ToolExecutionResult::text(result_text),
                         ));
+                    } else if tc.function.name == "sub_agent" {
+                        // Handle sub_agent: launch a nested ChatEngine
+                        if self.is_sub_agent {
+                            // Prevent recursive sub-agents
+                            let _ = event_tx.send(ChatEvent::ToolExecutionStart {
+                                id: tc.id.clone(),
+                                name: "sub_agent".to_string(),
+                            });
+                            let err_msg = format!(
+                                "Error: Sub-agents cannot spawn sub-agents.{}",
+                                tools::system_reminder(self.mode, "sub_agent")
+                            );
+                            let _ = event_tx.send(ChatEvent::ToolExecutionDone {
+                                id: tc.id.clone(),
+                                name: "sub_agent".to_string(),
+                                result: err_msg.clone(),
+                            });
+                            results[i] = Some((
+                                tc.id.clone(),
+                                tc.function.name.clone(),
+                                tools::ToolExecutionResult::text(err_msg),
+                            ));
+                        } else {
+                            let args = &parsed_args[i];
+                            let task = args
+                                .get("task")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("No task specified")
+                                .to_string();
+                            let max_turns_val = args
+                                .get("max_turns")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(10)
+                                .min(20) as usize;
+
+                            let _ = event_tx.send(ChatEvent::ToolExecutionStart {
+                                id: tc.id.clone(),
+                                name: "sub_agent".to_string(),
+                            });
+
+                            // Create sub-engine
+                            let mut sub_engine =
+                                ChatEngine::new(self.client.clone(), &self.model, Mode::Plan);
+                            sub_engine.set_max_turns(max_turns_val);
+                            sub_engine.set_sub_agent(true);
+                            sub_engine.set_cancel_token(self.cancel_token.clone());
+
+                            // Forward sub-agent tool events as SubAgentProgress
+                            let (sub_tx, mut sub_rx) =
+                                mpsc::unbounded_channel::<ChatEvent>();
+                            let parent_tx = event_tx.clone();
+                            let parent_id = tc.id.clone();
+                            let forward_handle = tokio::spawn(async move {
+                                while let Some(evt) = sub_rx.recv().await {
+                                    match evt {
+                                        ChatEvent::ToolExecutionStart { name, .. } => {
+                                            let _ = parent_tx.send(
+                                                ChatEvent::SubAgentProgress {
+                                                    id: parent_id.clone(),
+                                                    tool_name: name,
+                                                    done: false,
+                                                    error: false,
+                                                },
+                                            );
+                                        }
+                                        ChatEvent::ToolExecutionDone {
+                                            name, result, ..
+                                        } => {
+                                            let _ = parent_tx.send(
+                                                ChatEvent::SubAgentProgress {
+                                                    id: parent_id.clone(),
+                                                    tool_name: name,
+                                                    done: true,
+                                                    error: result.starts_with("Error:"),
+                                                },
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            });
+
+                            // Run sub-agent
+                            let _sub_result =
+                                sub_engine.send_message(&task, None, sub_tx).await;
+                            let _ = forward_handle.await;
+
+                            // Extract result + accumulate tokens
+                            let answer = sub_engine
+                                .last_assistant_content()
+                                .unwrap_or_else(|| "(no output)".to_string());
+                            self.accumulated_completion_tokens +=
+                                sub_engine.accumulated_completion_tokens;
+
+                            let result_msg = format!(
+                                "Sub-agent findings:\n\n{}{}",
+                                answer,
+                                tools::system_reminder(self.mode, "sub_agent")
+                            );
+
+                            let _ = event_tx.send(ChatEvent::ToolExecutionDone {
+                                id: tc.id.clone(),
+                                name: "sub_agent".to_string(),
+                                result: result_msg.clone(),
+                            });
+
+                            results[i] = Some((
+                                tc.id.clone(),
+                                tc.function.name.clone(),
+                                tools::ToolExecutionResult::text(result_msg),
+                            ));
+                        }
                     } else {
                         regular_indices.push(i);
                     }
